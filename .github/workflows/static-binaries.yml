@@ -1,0 +1,123 @@
+name: static-binaries
+
+# Builds self-contained aria2c binaries. Run by hand to get artifacts, or push
+# a tag named static-* to also publish them as a GitHub release.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+    - 'static-*'
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - arch: x86_64
+          runner: ubuntu-24.04
+        - arch: aarch64
+          runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@v7
+    - name: Build in Alpine
+      run: |
+        docker run --rm -v "$PWD":/src -w /src alpine:3.22 \
+          sh .github/scripts/build-static-linux.sh
+    - name: Smoke test (HTTPS download on the host)
+      run: |
+        # retried: aria2 gives up on the first failed TLS handshake
+        for attempt in 1 2 3; do
+          dist/aria2c --dir=/tmp --out=COPYING --allow-overwrite=true \
+            https://raw.githubusercontent.com/aria2/aria2/master/COPYING && break
+        done
+        cmp /tmp/COPYING COPYING
+    - name: Package
+      run: |
+        name=aria2c-linux-${{ matrix.arch }}
+        mkdir "$name" && cp dist/aria2c COPYING LICENSE.OpenSSL "$name"/
+        tar czf "$name.tar.gz" "$name"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: aria2c-linux-${{ matrix.arch }}
+        path: aria2c-linux-${{ matrix.arch }}.tar.gz
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - arch: arm64
+          runner: macos-15
+        - arch: x86_64
+          runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+    - uses: actions/checkout@v7
+    - name: Build tools
+      run: brew install autoconf automake libtool gettext pkg-config
+    # Only libraries that ship with macOS are linked (AppleTLS, zlib, libxml2,
+    # sqlite3), so the binary runs on a machine without Homebrew. The cost:
+    # no SFTP (libssh2) and no async DNS (c-ares).
+    - name: Build
+      run: |
+        autoreconf -i
+        ./configure \
+          --with-appletls --without-openssl --without-gnutls \
+          --without-libssh2 --without-libcares --without-libgmp \
+          --without-libnettle --without-libgcrypt --without-libexpat \
+          --disable-nls --disable-dependency-tracking
+        make -j"$(sysctl -n hw.ncpu)"
+        mkdir dist && cp src/aria2c dist/aria2c && strip dist/aria2c
+    - name: Check that only system libraries are linked
+      run: |
+        otool -L dist/aria2c
+        if otool -L dist/aria2c | tail -n +2 | grep -v -E '^\s+(/usr/lib/|/System/)'; then
+          echo "aria2c links a non-system library" >&2
+          exit 1
+        fi
+    - name: Smoke test (HTTPS download)
+      run: |
+        dist/aria2c --version
+        # retried: aria2 gives up on the first failed TLS handshake
+        for attempt in 1 2 3; do
+          dist/aria2c --dir=/tmp --out=COPYING --allow-overwrite=true \
+            https://raw.githubusercontent.com/aria2/aria2/master/COPYING && break
+        done
+        cmp /tmp/COPYING COPYING
+    - name: Package
+      run: |
+        name=aria2c-macos-${{ matrix.arch }}
+        mkdir "$name" && cp dist/aria2c COPYING "$name"/
+        tar czf "$name.tar.gz" "$name"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: aria2c-macos-${{ matrix.arch }}
+        path: aria2c-macos-${{ matrix.arch }}.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/static-')
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        merge-multiple: true
+    - name: Publish
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        sha256sum aria2c-*.tar.gz > SHA256SUMS
+        cat SHA256SUMS
+        gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+          --title "$GITHUB_REF_NAME" \
+          --notes "Static aria2c binaries built from commit $GITHUB_SHA. Source: https://github.com/$GITHUB_REPOSITORY/tree/$GITHUB_SHA" \
+          aria2c-*.tar.gz SHA256SUMS
